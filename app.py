@@ -15,7 +15,7 @@ from datetime import datetime, time
 # =========================================================
 
 st.set_page_config(
-    page_title="Factory Machine Analyser",
+    page_title="Factory Machines Analyser",
     layout="wide"
 )
 
@@ -975,7 +975,7 @@ def convert_to_excel(zone_result, rpm_ascending_result, filtered_data, match_tab
 # UI
 # =========================================================
 
-st.title("Factory Machine Analyser")
+st.title("iFactory Machine Zone Analyser")
 
 st.write("""
 This dashboard analyses iFactory CSV/ZIP files and creates continuous diameter zones.
