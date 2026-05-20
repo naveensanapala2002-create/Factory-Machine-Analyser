@@ -1,4 +1,5 @@
 import streamlit as st
+import os
 import pandas as pd
 import plotly.express as px
 import sqlite3
@@ -9,13 +10,14 @@ import numpy as np
 from pathlib import Path
 from io import BytesIO
 from datetime import datetime, time
+from sqlalchemy import create_engine, text as sa_text, inspect
 
 # =========================================================
 # APP SETTINGS
 # =========================================================
 
 st.set_page_config(
-    page_title="Factory Machines Analyser",
+    page_title="Factory Machine Analyser",
     layout="wide"
 )
 
@@ -44,7 +46,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-BASE_DIR = Path("C:/iFactory_Analyser")
+BASE_DIR = Path(os.environ.get("FACTORY_ANALYSER_DATA_DIR", "."))
 DB_DIR = BASE_DIR / "database"
 EXPORT_DIR = BASE_DIR / "exports"
 DB_PATH = DB_DIR / "ifactory_machine_data.db"
@@ -144,7 +146,91 @@ def get_matching_machine_names(saved_machine_list, available_machines):
 # DATABASE
 # =========================================================
 
+def get_persistent_database_url():
+    """
+    Persistent cloud storage logic.
+
+    Local SQLite is fine for local/factory PC use.
+    For Streamlit Community Cloud, local SQLite/files are temporary and may be lost
+    when the app sleeps, reboots, or redeploys.
+
+    To make data permanent in cloud, add DATABASE_URL in Streamlit Cloud secrets:
+    DATABASE_URL = "postgresql://USER:PASSWORD@HOST:PORT/DATABASE"
+
+    Supported secret names:
+    1) DATABASE_URL
+    2) [database]
+       url = "postgresql://..."
+    3) [connections.factory_db]
+       url = "postgresql://..."
+    """
+    url = os.environ.get("DATABASE_URL", "")
+
+    try:
+        if not url and "DATABASE_URL" in st.secrets:
+            url = st.secrets["DATABASE_URL"]
+    except Exception:
+        pass
+
+    try:
+        if not url and "database" in st.secrets and "url" in st.secrets["database"]:
+            url = st.secrets["database"]["url"]
+    except Exception:
+        pass
+
+    try:
+        if (
+            not url
+            and "connections" in st.secrets
+            and "factory_db" in st.secrets["connections"]
+            and "url" in st.secrets["connections"]["factory_db"]
+        ):
+            url = st.secrets["connections"]["factory_db"]["url"]
+    except Exception:
+        pass
+
+    return str(url).strip()
+
+
+def normalize_database_url(url):
+    """
+    Some providers give postgres:// URLs.
+    SQLAlchemy expects postgresql+psycopg2:// or postgresql://.
+    """
+    if url.startswith("postgres://"):
+        return url.replace("postgres://", "postgresql+psycopg2://", 1)
+
+    if url.startswith("postgresql://") and "+psycopg2" not in url:
+        return url.replace("postgresql://", "postgresql+psycopg2://", 1)
+
+    return url
+
+
+DATABASE_URL = normalize_database_url(get_persistent_database_url())
+USE_EXTERNAL_DATABASE = bool(DATABASE_URL)
+
+
+@st.cache_resource(show_spinner=False)
+def get_external_engine():
+    if not DATABASE_URL:
+        return None
+
+    return create_engine(
+        DATABASE_URL,
+        pool_pre_ping=True,
+        pool_recycle=1800
+    )
+
+
 def get_connection():
+    """
+    Returns:
+    - SQLAlchemy engine when DATABASE_URL is configured.
+    - SQLite connection for local fallback.
+    """
+    if USE_EXTERNAL_DATABASE:
+        return get_external_engine()
+
     conn = sqlite3.connect(
         DB_PATH,
         timeout=30,
@@ -155,14 +241,86 @@ def get_connection():
     return conn
 
 
-def table_columns(conn, table_name):
+def get_table_columns(table_name):
+    if USE_EXTERNAL_DATABASE:
+        engine = get_external_engine()
+        inspector = inspect(engine)
+
+        if not inspector.has_table(table_name):
+            return []
+
+        return [col["name"] for col in inspector.get_columns(table_name)]
+
+    conn = get_connection()
     cur = conn.cursor()
     cur.execute(f"PRAGMA table_info({table_name})")
     rows = cur.fetchall()
+    conn.close()
     return [row[1] for row in rows]
 
 
 def create_database():
+    if USE_EXTERNAL_DATABASE:
+        engine = get_external_engine()
+
+        with engine.begin() as conn:
+            conn.execute(sa_text("""
+                CREATE TABLE IF NOT EXISTS machine_data (
+                    id SERIAL PRIMARY KEY,
+                    timestamp TEXT,
+                    machine_name TEXT,
+                    machine_key TEXT,
+                    diameter DOUBLE PRECISION,
+                    rpm DOUBLE PRECISION,
+                    line_speed DOUBLE PRECISION,
+                    quantity DOUBLE PRECISION,
+                    diameter_source_column TEXT,
+                    rpm_source_column TEXT,
+                    speed_source_column TEXT,
+                    data_pair TEXT,
+                    source_file TEXT,
+                    uploaded_date TEXT
+                )
+            """))
+
+            conn.execute(sa_text("""
+                CREATE TABLE IF NOT EXISTS saved_machines (
+                    id SERIAL PRIMARY KEY,
+                    machine_name TEXT UNIQUE,
+                    machine_key TEXT,
+                    saved_date TEXT
+                )
+            """))
+
+            required_machine_data_cols = {
+                "machine_key": "TEXT",
+                "diameter_source_column": "TEXT",
+                "rpm_source_column": "TEXT",
+                "speed_source_column": "TEXT",
+                "data_pair": "TEXT",
+                "line_speed": "DOUBLE PRECISION",
+                "quantity": "DOUBLE PRECISION",
+                "source_file": "TEXT",
+                "uploaded_date": "TEXT"
+            }
+
+            for col, dtype in required_machine_data_cols.items():
+                conn.execute(sa_text(
+                    f"ALTER TABLE machine_data ADD COLUMN IF NOT EXISTS {col} {dtype}"
+                ))
+
+            required_saved_cols = {
+                "machine_key": "TEXT",
+                "saved_date": "TEXT"
+            }
+
+            for col, dtype in required_saved_cols.items():
+                conn.execute(sa_text(
+                    f"ALTER TABLE saved_machines ADD COLUMN IF NOT EXISTS {col} {dtype}"
+                ))
+
+        return
+
     conn = get_connection()
     cur = conn.cursor()
 
@@ -193,7 +351,7 @@ def create_database():
         )
     """)
 
-    machine_data_cols = table_columns(conn, "machine_data")
+    machine_data_cols = get_table_columns("machine_data")
 
     required_machine_data_cols = {
         "machine_key": "TEXT",
@@ -207,7 +365,7 @@ def create_database():
         if col not in machine_data_cols:
             cur.execute(f"ALTER TABLE machine_data ADD COLUMN {col} {dtype}")
 
-    saved_cols = table_columns(conn, "saved_machines")
+    saved_cols = get_table_columns("saved_machines")
 
     required_saved_cols = {
         "machine_key": "TEXT",
@@ -223,7 +381,7 @@ def create_database():
 
 
 def save_to_database(df):
-    conn = get_connection()
+    create_database()
 
     save_cols = [
         "timestamp",
@@ -247,6 +405,8 @@ def save_to_database(df):
 
     save_df = df[save_cols].copy()
 
+    conn = get_connection()
+
     save_df.to_sql(
         "machine_data",
         conn,
@@ -254,16 +414,18 @@ def save_to_database(df):
         index=False
     )
 
-    conn.close()
+    if not USE_EXTERNAL_DATABASE:
+        conn.close()
 
 
 def load_database():
-    if not DB_PATH.exists():
-        return pd.DataFrame()
+    create_database()
 
     conn = get_connection()
     df = pd.read_sql_query("SELECT * FROM machine_data", conn)
-    conn.close()
+
+    if not USE_EXTERNAL_DATABASE:
+        conn.close()
 
     if df.empty:
         return df
@@ -293,6 +455,14 @@ def load_database():
 
 
 def clear_database():
+    create_database()
+
+    if USE_EXTERNAL_DATABASE:
+        engine = get_external_engine()
+        with engine.begin() as conn:
+            conn.execute(sa_text("DELETE FROM machine_data"))
+        return
+
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("DELETE FROM machine_data")
@@ -302,6 +472,30 @@ def clear_database():
 
 def save_machine_list(machine_names):
     create_database()
+
+    if USE_EXTERNAL_DATABASE:
+        engine = get_external_engine()
+
+        with engine.begin() as conn:
+            conn.execute(sa_text("DELETE FROM saved_machines"))
+
+            for machine in machine_names:
+                machine = machine.strip()
+
+                if machine:
+                    conn.execute(sa_text("""
+                        INSERT INTO saved_machines
+                        (machine_name, machine_key, saved_date)
+                        VALUES (:machine_name, :machine_key, :saved_date)
+                        ON CONFLICT (machine_name) DO NOTHING
+                    """), {
+                        "machine_name": machine,
+                        "machine_key": make_machine_key(machine),
+                        "saved_date": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    })
+
+        return
+
     conn = None
 
     try:
@@ -341,17 +535,29 @@ def load_saved_machine_list():
     create_database()
 
     conn = get_connection()
-    cur = conn.cursor()
+    df = pd.read_sql_query(
+        "SELECT machine_name FROM saved_machines ORDER BY machine_name",
+        conn
+    )
 
-    cur.execute("SELECT machine_name FROM saved_machines ORDER BY machine_name")
-    rows = cur.fetchall()
+    if not USE_EXTERNAL_DATABASE:
+        conn.close()
 
-    conn.close()
-    return [row[0] for row in rows]
+    if df.empty:
+        return []
+
+    return df["machine_name"].dropna().tolist()
 
 
 def clear_saved_machine_list():
     create_database()
+
+    if USE_EXTERNAL_DATABASE:
+        engine = get_external_engine()
+        with engine.begin() as conn:
+            conn.execute(sa_text("DELETE FROM saved_machines"))
+        return
+
     conn = None
 
     try:
@@ -360,6 +566,7 @@ def clear_saved_machine_list():
 
         cur.execute("BEGIN IMMEDIATE")
         cur.execute("DELETE FROM saved_machines")
+
         conn.commit()
 
     except Exception as e:
@@ -957,12 +1164,108 @@ def create_rpm_max_ascending_zone_table(zone_result):
     return result
 
 
-def convert_to_excel(zone_result, rpm_ascending_result, filtered_data, match_table):
+
+def create_same_diameter_selected_machines_table(zone_result, selected_machines):
+    """
+    Creates an additional comparison table below RPM Max Ascending Zone Table.
+
+    Requirement:
+    - Compare all machines selected in Zone Analysis Dropdown.
+    - Find diameter values that are common across all selected machines.
+    - For those common diameter values, show each machine's zone details:
+      diameter, screw RPM, speed, start time, end time, and duration.
+    - Existing tables are not disturbed.
+    """
+    if zone_result.empty or not selected_machines or len(selected_machines) < 2:
+        return pd.DataFrame()
+
+    work = zone_result.copy()
+
+    required_base_cols = ["Machine", "Diameter", "Screw RPM Max", "Speed at RPM Max"]
+    for col in required_base_cols:
+        if col not in work.columns:
+            return pd.DataFrame()
+
+    work["Diameter"] = pd.to_numeric(work["Diameter"], errors="coerce")
+    work["Screw RPM Max"] = pd.to_numeric(work["Screw RPM Max"], errors="coerce")
+    work["Speed at RPM Max"] = pd.to_numeric(work["Speed at RPM Max"], errors="coerce")
+
+    # Keep only meaningful RPM and speed rows.
+    work = work[
+        (work["Diameter"].notna()) &
+        (work["Screw RPM Max"] > 0) &
+        (work["Speed at RPM Max"] > 0)
+    ].copy()
+
+    if work.empty:
+        return pd.DataFrame()
+
+    selected_machine_set = set(selected_machines)
+
+    diameter_machine_count = (
+        work.groupby("Diameter")["Machine"]
+        .apply(lambda s: len(set(s).intersection(selected_machine_set)))
+        .reset_index(name="Selected Machines Available")
+    )
+
+    # Strict comparison: same diameter should be available in all selected machines.
+    common_diameters = diameter_machine_count[
+        diameter_machine_count["Selected Machines Available"] == len(selected_machine_set)
+    ]["Diameter"].tolist()
+
+    if not common_diameters:
+        return pd.DataFrame()
+
+    result = work[work["Diameter"].isin(common_diameters)].copy()
+
+    result = result.rename(columns={
+        "Machine": "Selected Machine",
+        "Diameter": "Same Diameter in Selected Machines",
+        "Screw RPM Max": "Screw RPM",
+        "Speed at RPM Max": "Speed",
+        "Start Timestamp": "Start Time",
+        "End Timestamp": "End Time",
+        "Duration Minutes": "Duration in Minutes"
+    })
+
+    output_cols = [
+        "Selected Machine",
+        "Same Diameter in Selected Machines",
+        "Screw RPM",
+        "Speed",
+        "Start Time",
+        "End Time",
+        "Duration",
+        "Duration in Minutes",
+        "Data Pair",
+        "RPM Max Timestamp",
+        "Diameter Source",
+        "RPM Source",
+        "Speed Source"
+    ]
+
+    for col in output_cols:
+        if col not in result.columns:
+            result[col] = None
+
+    result = result[output_cols].copy()
+
+    result = result.sort_values(
+        by=["Same Diameter in Selected Machines", "Selected Machine", "Screw RPM", "Start Time"],
+        ascending=[True, True, True, True]
+    ).reset_index(drop=True)
+
+    result.insert(0, "Sl.No", range(1, len(result) + 1))
+
+    return result
+
+def convert_to_excel(zone_result, rpm_ascending_result, same_diameter_result, filtered_data, match_table):
     output = BytesIO()
 
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         zone_result.to_excel(writer, index=False, sheet_name="Continuous Diameter Zones")
         rpm_ascending_result.to_excel(writer, index=False, sheet_name="RPM Max Ascending Zones")
+        same_diameter_result.to_excel(writer, index=False, sheet_name="Same Diameter Comparison")
         filtered_data.to_excel(writer, index=False, sheet_name="Selected Machines Raw Data")
 
         if not match_table.empty:
@@ -975,7 +1278,7 @@ def convert_to_excel(zone_result, rpm_ascending_result, filtered_data, match_tab
 # UI
 # =========================================================
 
-st.title("iFactory Machine Zone Analyser")
+st.title("Factory Machine Analyser")
 
 st.write("""
 This dashboard analyses iFactory CSV/ZIP files and creates continuous diameter zones.
@@ -1047,6 +1350,12 @@ with tab1:
                 st.dataframe(pd.DataFrame(errors), use_container_width=True)
 
     current_data = load_database()
+
+    if USE_EXTERNAL_DATABASE:
+        st.success("Storage Mode: Persistent cloud database connected. Uploaded data will remain after app sleep/reboot.")
+    else:
+        st.warning("Storage Mode: Local SQLite. On Streamlit Cloud this is temporary and may be lost after app sleep/reboot. Add DATABASE_URL in app Secrets for permanent storage.")
+
     st.subheader("Current Database Status")
     st.metric("Total Stored Rows", len(current_data))
 
@@ -1272,6 +1581,10 @@ with tab3:
             zone_result = pd.DataFrame()
 
         rpm_ascending_result = create_rpm_max_ascending_zone_table(zone_result)
+        same_diameter_result = create_same_diameter_selected_machines_table(
+            zone_result,
+            selected_machines
+        )
 
         st.subheader("Selected Date & Time Range")
         st.info(
@@ -1367,6 +1680,20 @@ with tab3:
             else:
                 st.dataframe(rpm_ascending_result, use_container_width=True)
 
+            st.subheader("Same Diameter Comparison Table")
+            st.caption(
+                "This table compares all machines selected in the Zone Analysis Dropdown. "
+                "Only diameter values available in all selected machines are shown. "
+                "RPM and speed values greater than 0 are considered."
+            )
+
+            if len(selected_machines) < 2:
+                st.info("Select two or more machines to compare same diameter values across machines.")
+            elif same_diameter_result.empty:
+                st.warning("No same diameter values found across all selected machines in the selected date/time range.")
+            else:
+                st.dataframe(same_diameter_result, use_container_width=True)
+
             st.subheader("Graph 1: Zone Duration by Diameter")
 
             fig_duration = px.bar(
@@ -1440,6 +1767,7 @@ with tab3:
         excel_data = convert_to_excel(
             zone_result,
             rpm_ascending_result,
+            same_diameter_result,
             selected_data,
             match_table
         )
@@ -1463,8 +1791,14 @@ with tab4:
     db_data = load_database()
     saved_machines = load_saved_machine_list()
 
-    st.write("Database file location:")
-    st.code(str(DB_PATH))
+    st.write("Database storage mode:")
+
+    if USE_EXTERNAL_DATABASE:
+        st.success("Persistent cloud database is connected through DATABASE_URL.")
+        st.code("External PostgreSQL / cloud database")
+    else:
+        st.warning("Local SQLite fallback is active. On Streamlit Cloud, this is not permanent.")
+        st.code(str(DB_PATH))
 
     st.metric("Total Stored Rows", len(db_data))
     st.metric("Frozen Machines Count", len(saved_machines))
