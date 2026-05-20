@@ -11,6 +11,7 @@ from pathlib import Path
 from io import BytesIO
 from datetime import datetime, time
 from sqlalchemy import create_engine, text as sa_text, inspect
+from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
 
 # =========================================================
 # APP SETTINGS
@@ -192,11 +193,82 @@ def get_persistent_database_url():
     return str(url).strip()
 
 
+def convert_supabase_direct_url_to_pooler(url):
+    """
+    Streamlit Community Cloud can fail when connecting to Supabase direct DB host
+    db.<project-ref>.supabase.co:5432 because that endpoint may resolve to IPv6.
+
+    Supabase recommends using the connection pooler for deployed/serverless apps.
+    This function converts:
+        postgresql://postgres:<password>@db.<ref>.supabase.co:5432/postgres
+    into:
+        postgresql://postgres.<ref>:<password>@aws-1-ap-south-1.pooler.supabase.com:6543/postgres?pgbouncer=true
+
+    The pooler host can be overridden using Streamlit secret / environment variable:
+        SUPABASE_POOLER_HOST = "aws-1-ap-south-1.pooler.supabase.com"
+    """
+    if not url:
+        return url
+
+    try:
+        parsed = urlparse(url)
+        host = parsed.hostname or ""
+
+        if not (host.startswith("db.") and host.endswith(".supabase.co")):
+            return url
+
+        project_ref = host.replace("db.", "", 1).replace(".supabase.co", "")
+        username = parsed.username or "postgres"
+        password = parsed.password or ""
+
+        # Supabase pooler username format is normally postgres.<project-ref>
+        if username == "postgres":
+            username = f"postgres.{project_ref}"
+
+        pooler_host = os.environ.get("SUPABASE_POOLER_HOST", "")
+
+        try:
+            if not pooler_host and "SUPABASE_POOLER_HOST" in st.secrets:
+                pooler_host = st.secrets["SUPABASE_POOLER_HOST"]
+        except Exception:
+            pass
+
+        # Your Supabase project is in South Asia / Mumbai, shown by Supabase as aws-1-ap-south-1.
+        if not pooler_host:
+            pooler_host = "aws-1-ap-south-1.pooler.supabase.com"
+
+        netloc = f"{username}:{password}@{pooler_host}:6543"
+
+        query_items = dict(parse_qsl(parsed.query, keep_blank_values=True))
+        query_items["pgbouncer"] = "true"
+        query = urlencode(query_items)
+
+        return urlunparse((
+            parsed.scheme,
+            netloc,
+            parsed.path or "/postgres",
+            "",
+            query,
+            ""
+        ))
+
+    except Exception:
+        return url
+
+
 def normalize_database_url(url):
     """
-    Some providers give postgres:// URLs.
-    SQLAlchemy expects postgresql+psycopg2:// or postgresql://.
+    Makes DATABASE_URL suitable for SQLAlchemy + psycopg2.
+    Also converts Supabase direct connection URLs to Supabase pooler URLs,
+    fixing Streamlit Cloud error: Cannot assign requested address.
     """
+    url = str(url).strip()
+
+    if not url:
+        return url
+
+    url = convert_supabase_direct_url_to_pooler(url)
+
     if url.startswith("postgres://"):
         return url.replace("postgres://", "postgresql+psycopg2://", 1)
 
@@ -206,7 +278,8 @@ def normalize_database_url(url):
     return url
 
 
-DATABASE_URL = normalize_database_url(get_persistent_database_url())
+RAW_DATABASE_URL = get_persistent_database_url()
+DATABASE_URL = normalize_database_url(RAW_DATABASE_URL)
 USE_EXTERNAL_DATABASE = bool(DATABASE_URL)
 
 
@@ -218,7 +291,8 @@ def get_external_engine():
     return create_engine(
         DATABASE_URL,
         pool_pre_ping=True,
-        pool_recycle=1800
+        pool_recycle=1800,
+        connect_args={"sslmode": "require"}
     )
 
 
