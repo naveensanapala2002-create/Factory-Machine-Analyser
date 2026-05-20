@@ -193,19 +193,60 @@ def get_persistent_database_url():
     return str(url).strip()
 
 
+def remove_psycopg2_unsupported_query_options(url):
+    """
+    psycopg2 does not accept Supabase's Prisma/ORM query option:
+        ?pgbouncer=true
+
+    If pgbouncer=true is present in DATABASE_URL, psycopg2 throws:
+        invalid dsn: invalid connection option "pgbouncer"
+
+    This function removes only unsupported query parameters and keeps the
+    connection URL usable for SQLAlchemy + psycopg2.
+    """
+    if not url:
+        return url
+
+    try:
+        parsed = urlparse(url)
+        query_items = parse_qsl(parsed.query, keep_blank_values=True)
+
+        # Remove query options that psycopg2 does not understand.
+        allowed_items = [
+            (key, value)
+            for key, value in query_items
+            if key.lower() not in {"pgbouncer"}
+        ]
+
+        cleaned_query = urlencode(allowed_items)
+
+        return urlunparse((
+            parsed.scheme,
+            parsed.netloc,
+            parsed.path,
+            parsed.params,
+            cleaned_query,
+            parsed.fragment
+        ))
+
+    except Exception:
+        return url
+
+
 def convert_supabase_direct_url_to_pooler(url):
     """
     Streamlit Community Cloud can fail when connecting to Supabase direct DB host
     db.<project-ref>.supabase.co:5432 because that endpoint may resolve to IPv6.
 
-    Supabase recommends using the connection pooler for deployed/serverless apps.
     This function converts:
         postgresql://postgres:<password>@db.<ref>.supabase.co:5432/postgres
-    into:
-        postgresql://postgres.<ref>:<password>@aws-1-ap-south-1.pooler.supabase.com:6543/postgres?pgbouncer=true
 
-    The pooler host can be overridden using Streamlit secret / environment variable:
-        SUPABASE_POOLER_HOST = "aws-1-ap-south-1.pooler.supabase.com"
+    into Supabase pooler format:
+        postgresql://postgres.<ref>:<password>@aws-1-ap-south-1.pooler.supabase.com:6543/postgres
+
+    Important:
+    Do NOT add ?pgbouncer=true for psycopg2.
+    That query option is shown by Supabase for some ORM tools, but psycopg2 rejects it.
     """
     if not url:
         return url
@@ -214,8 +255,13 @@ def convert_supabase_direct_url_to_pooler(url):
         parsed = urlparse(url)
         host = parsed.hostname or ""
 
+        # If it is already a pooler URL, only clean unsupported query options.
+        if "pooler.supabase.com" in host:
+            return remove_psycopg2_unsupported_query_options(url)
+
+        # Convert only Supabase direct DB host.
         if not (host.startswith("db.") and host.endswith(".supabase.co")):
-            return url
+            return remove_psycopg2_unsupported_query_options(url)
 
         project_ref = host.replace("db.", "", 1).replace(".supabase.co", "")
         username = parsed.username or "postgres"
@@ -233,34 +279,39 @@ def convert_supabase_direct_url_to_pooler(url):
         except Exception:
             pass
 
-        # Your Supabase project is in South Asia / Mumbai, shown by Supabase as aws-1-ap-south-1.
+        # Your Supabase project is in South Asia / Mumbai.
+        # If your Supabase screen shows a different pooler host, put it in Streamlit Secrets as:
+        # SUPABASE_POOLER_HOST = "your-pooler-host"
         if not pooler_host:
             pooler_host = "aws-1-ap-south-1.pooler.supabase.com"
 
-        netloc = f"{username}:{password}@{pooler_host}:6543"
-
-        query_items = dict(parse_qsl(parsed.query, keep_blank_values=True))
-        query_items["pgbouncer"] = "true"
-        query = urlencode(query_items)
+        # Keep password exactly as supplied in the URL.
+        # If password contains special characters, it should already be URL-encoded in Streamlit Secrets.
+        if password:
+            netloc = f"{username}:{password}@{pooler_host}:6543"
+        else:
+            netloc = f"{username}@{pooler_host}:6543"
 
         return urlunparse((
             parsed.scheme,
             netloc,
             parsed.path or "/postgres",
             "",
-            query,
+            "",
             ""
         ))
 
     except Exception:
-        return url
+        return remove_psycopg2_unsupported_query_options(url)
 
 
 def normalize_database_url(url):
     """
     Makes DATABASE_URL suitable for SQLAlchemy + psycopg2.
-    Also converts Supabase direct connection URLs to Supabase pooler URLs,
-    fixing Streamlit Cloud error: Cannot assign requested address.
+
+    Fixes both Supabase deployment issues:
+    1. Direct URL IPv6 connection issue on Streamlit Cloud.
+    2. psycopg2 invalid DSN error caused by ?pgbouncer=true.
     """
     url = str(url).strip()
 
@@ -268,6 +319,7 @@ def normalize_database_url(url):
         return url
 
     url = convert_supabase_direct_url_to_pooler(url)
+    url = remove_psycopg2_unsupported_query_options(url)
 
     if url.startswith("postgres://"):
         return url.replace("postgres://", "postgresql+psycopg2://", 1)
