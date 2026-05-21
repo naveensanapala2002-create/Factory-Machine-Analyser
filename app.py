@@ -11,7 +11,6 @@ from pathlib import Path
 from io import BytesIO
 from datetime import datetime, time
 from sqlalchemy import create_engine, text as sa_text, inspect
-from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
 
 # =========================================================
 # APP SETTINGS
@@ -193,134 +192,11 @@ def get_persistent_database_url():
     return str(url).strip()
 
 
-def remove_psycopg2_unsupported_query_options(url):
-    """
-    psycopg2 does not accept Supabase's Prisma/ORM query option:
-        ?pgbouncer=true
-
-    If pgbouncer=true is present in DATABASE_URL, psycopg2 throws:
-        invalid dsn: invalid connection option "pgbouncer"
-
-    This function removes only unsupported query parameters and keeps the
-    connection URL usable for SQLAlchemy + psycopg2.
-    """
-    if not url:
-        return url
-
-    try:
-        parsed = urlparse(url)
-        query_items = parse_qsl(parsed.query, keep_blank_values=True)
-
-        # Remove query options that psycopg2 does not understand.
-        allowed_items = [
-            (key, value)
-            for key, value in query_items
-            if key.lower() not in {"pgbouncer"}
-        ]
-
-        cleaned_query = urlencode(allowed_items)
-
-        return urlunparse((
-            parsed.scheme,
-            parsed.netloc,
-            parsed.path,
-            parsed.params,
-            cleaned_query,
-            parsed.fragment
-        ))
-
-    except Exception:
-        return url
-
-
-def convert_supabase_direct_url_to_pooler(url):
-    """
-    Streamlit Community Cloud can fail when connecting to Supabase direct DB host
-    db.<project-ref>.supabase.co:5432 because that endpoint may resolve to IPv6.
-
-    This function converts:
-        postgresql://postgres:<password>@db.<ref>.supabase.co:5432/postgres
-
-    into Supabase pooler format:
-        postgresql://postgres.<ref>:<password>@aws-1-ap-south-1.pooler.supabase.com:6543/postgres
-
-    Important:
-    Do NOT add ?pgbouncer=true for psycopg2.
-    That query option is shown by Supabase for some ORM tools, but psycopg2 rejects it.
-    """
-    if not url:
-        return url
-
-    try:
-        parsed = urlparse(url)
-        host = parsed.hostname or ""
-
-        # If it is already a pooler URL, only clean unsupported query options.
-        if "pooler.supabase.com" in host:
-            return remove_psycopg2_unsupported_query_options(url)
-
-        # Convert only Supabase direct DB host.
-        if not (host.startswith("db.") and host.endswith(".supabase.co")):
-            return remove_psycopg2_unsupported_query_options(url)
-
-        project_ref = host.replace("db.", "", 1).replace(".supabase.co", "")
-        username = parsed.username or "postgres"
-        password = parsed.password or ""
-
-        # Supabase pooler username format is normally postgres.<project-ref>
-        if username == "postgres":
-            username = f"postgres.{project_ref}"
-
-        pooler_host = os.environ.get("SUPABASE_POOLER_HOST", "")
-
-        try:
-            if not pooler_host and "SUPABASE_POOLER_HOST" in st.secrets:
-                pooler_host = st.secrets["SUPABASE_POOLER_HOST"]
-        except Exception:
-            pass
-
-        # Your Supabase project is in South Asia / Mumbai.
-        # If your Supabase screen shows a different pooler host, put it in Streamlit Secrets as:
-        # SUPABASE_POOLER_HOST = "your-pooler-host"
-        if not pooler_host:
-            pooler_host = "aws-1-ap-south-1.pooler.supabase.com"
-
-        # Keep password exactly as supplied in the URL.
-        # If password contains special characters, it should already be URL-encoded in Streamlit Secrets.
-        if password:
-            netloc = f"{username}:{password}@{pooler_host}:6543"
-        else:
-            netloc = f"{username}@{pooler_host}:6543"
-
-        return urlunparse((
-            parsed.scheme,
-            netloc,
-            parsed.path or "/postgres",
-            "",
-            "",
-            ""
-        ))
-
-    except Exception:
-        return remove_psycopg2_unsupported_query_options(url)
-
-
 def normalize_database_url(url):
     """
-    Makes DATABASE_URL suitable for SQLAlchemy + psycopg2.
-
-    Fixes both Supabase deployment issues:
-    1. Direct URL IPv6 connection issue on Streamlit Cloud.
-    2. psycopg2 invalid DSN error caused by ?pgbouncer=true.
+    Some providers give postgres:// URLs.
+    SQLAlchemy expects postgresql+psycopg2:// or postgresql://.
     """
-    url = str(url).strip()
-
-    if not url:
-        return url
-
-    url = convert_supabase_direct_url_to_pooler(url)
-    url = remove_psycopg2_unsupported_query_options(url)
-
     if url.startswith("postgres://"):
         return url.replace("postgres://", "postgresql+psycopg2://", 1)
 
@@ -330,8 +206,7 @@ def normalize_database_url(url):
     return url
 
 
-RAW_DATABASE_URL = get_persistent_database_url()
-DATABASE_URL = normalize_database_url(RAW_DATABASE_URL)
+DATABASE_URL = normalize_database_url(get_persistent_database_url())
 USE_EXTERNAL_DATABASE = bool(DATABASE_URL)
 
 
@@ -343,8 +218,7 @@ def get_external_engine():
     return create_engine(
         DATABASE_URL,
         pool_pre_ping=True,
-        pool_recycle=1800,
-        connect_args={"sslmode": "require"}
+        pool_recycle=1800
     )
 
 
@@ -1290,108 +1164,12 @@ def create_rpm_max_ascending_zone_table(zone_result):
     return result
 
 
-
-def create_same_diameter_selected_machines_table(zone_result, selected_machines):
-    """
-    Creates an additional comparison table below RPM Max Ascending Zone Table.
-
-    Requirement:
-    - Compare all machines selected in Zone Analysis Dropdown.
-    - Find diameter values that are common across all selected machines.
-    - For those common diameter values, show each machine's zone details:
-      diameter, screw RPM, speed, start time, end time, and duration.
-    - Existing tables are not disturbed.
-    """
-    if zone_result.empty or not selected_machines or len(selected_machines) < 2:
-        return pd.DataFrame()
-
-    work = zone_result.copy()
-
-    required_base_cols = ["Machine", "Diameter", "Screw RPM Max", "Speed at RPM Max"]
-    for col in required_base_cols:
-        if col not in work.columns:
-            return pd.DataFrame()
-
-    work["Diameter"] = pd.to_numeric(work["Diameter"], errors="coerce")
-    work["Screw RPM Max"] = pd.to_numeric(work["Screw RPM Max"], errors="coerce")
-    work["Speed at RPM Max"] = pd.to_numeric(work["Speed at RPM Max"], errors="coerce")
-
-    # Keep only meaningful RPM and speed rows.
-    work = work[
-        (work["Diameter"].notna()) &
-        (work["Screw RPM Max"] > 0) &
-        (work["Speed at RPM Max"] > 0)
-    ].copy()
-
-    if work.empty:
-        return pd.DataFrame()
-
-    selected_machine_set = set(selected_machines)
-
-    diameter_machine_count = (
-        work.groupby("Diameter")["Machine"]
-        .apply(lambda s: len(set(s).intersection(selected_machine_set)))
-        .reset_index(name="Selected Machines Available")
-    )
-
-    # Strict comparison: same diameter should be available in all selected machines.
-    common_diameters = diameter_machine_count[
-        diameter_machine_count["Selected Machines Available"] == len(selected_machine_set)
-    ]["Diameter"].tolist()
-
-    if not common_diameters:
-        return pd.DataFrame()
-
-    result = work[work["Diameter"].isin(common_diameters)].copy()
-
-    result = result.rename(columns={
-        "Machine": "Selected Machine",
-        "Diameter": "Same Diameter in Selected Machines",
-        "Screw RPM Max": "Screw RPM",
-        "Speed at RPM Max": "Speed",
-        "Start Timestamp": "Start Time",
-        "End Timestamp": "End Time",
-        "Duration Minutes": "Duration in Minutes"
-    })
-
-    output_cols = [
-        "Selected Machine",
-        "Same Diameter in Selected Machines",
-        "Screw RPM",
-        "Speed",
-        "Start Time",
-        "End Time",
-        "Duration",
-        "Duration in Minutes",
-        "Data Pair",
-        "RPM Max Timestamp",
-        "Diameter Source",
-        "RPM Source",
-        "Speed Source"
-    ]
-
-    for col in output_cols:
-        if col not in result.columns:
-            result[col] = None
-
-    result = result[output_cols].copy()
-
-    result = result.sort_values(
-        by=["Same Diameter in Selected Machines", "Selected Machine", "Screw RPM", "Start Time"],
-        ascending=[True, True, True, True]
-    ).reset_index(drop=True)
-
-    result.insert(0, "Sl.No", range(1, len(result) + 1))
-
-    return result
-
-def convert_to_excel(zone_result, rpm_ascending_result, same_diameter_result, filtered_data, match_table):
+def convert_to_excel(zone_result, rpm_ascending_result, filtered_data, match_table):
     output = BytesIO()
 
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         zone_result.to_excel(writer, index=False, sheet_name="Continuous Diameter Zones")
         rpm_ascending_result.to_excel(writer, index=False, sheet_name="RPM Max Ascending Zones")
-        same_diameter_result.to_excel(writer, index=False, sheet_name="Same Diameter Comparison")
         filtered_data.to_excel(writer, index=False, sheet_name="Selected Machines Raw Data")
 
         if not match_table.empty:
@@ -1707,10 +1485,6 @@ with tab3:
             zone_result = pd.DataFrame()
 
         rpm_ascending_result = create_rpm_max_ascending_zone_table(zone_result)
-        same_diameter_result = create_same_diameter_selected_machines_table(
-            zone_result,
-            selected_machines
-        )
 
         st.subheader("Selected Date & Time Range")
         st.info(
@@ -1806,20 +1580,6 @@ with tab3:
             else:
                 st.dataframe(rpm_ascending_result, use_container_width=True)
 
-            st.subheader("Same Diameter Comparison Table")
-            st.caption(
-                "This table compares all machines selected in the Zone Analysis Dropdown. "
-                "Only diameter values available in all selected machines are shown. "
-                "RPM and speed values greater than 0 are considered."
-            )
-
-            if len(selected_machines) < 2:
-                st.info("Select two or more machines to compare same diameter values across machines.")
-            elif same_diameter_result.empty:
-                st.warning("No same diameter values found across all selected machines in the selected date/time range.")
-            else:
-                st.dataframe(same_diameter_result, use_container_width=True)
-
             st.subheader("Graph 1: Zone Duration by Diameter")
 
             fig_duration = px.bar(
@@ -1893,7 +1653,6 @@ with tab3:
         excel_data = convert_to_excel(
             zone_result,
             rpm_ascending_result,
-            same_diameter_result,
             selected_data,
             match_table
         )
