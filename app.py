@@ -11,7 +11,18 @@ import numpy as np
 from pathlib import Path
 from io import BytesIO
 from datetime import datetime, time
-from sqlalchemy import create_engine, text as sa_text, inspect
+# SQLAlchemy / psycopg2 are required only for Supabase/PostgreSQL cloud storage.
+# Keep this import safe so the Streamlit app does not crash if requirements.txt was not updated.
+try:
+    from sqlalchemy import create_engine, text as sa_text, inspect
+    SQLALCHEMY_AVAILABLE = True
+    SQLALCHEMY_IMPORT_ERROR = None
+except Exception as _sqlalchemy_import_error:
+    create_engine = None
+    sa_text = None
+    inspect = None
+    SQLALCHEMY_AVAILABLE = False
+    SQLALCHEMY_IMPORT_ERROR = _sqlalchemy_import_error
 from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode, quote, unquote
 
 # =========================================================
@@ -364,12 +375,24 @@ def get_external_engine():
     if not DATABASE_URL:
         return None
 
-    return create_engine(
-        DATABASE_URL,
-        pool_pre_ping=True,
-        pool_recycle=1800,
-        connect_args={"sslmode": "require", "connect_timeout": 15}
-    )
+    if not SQLALCHEMY_AVAILABLE:
+        set_database_error(
+            "SQLAlchemy / psycopg2 is not installed. Please update requirements.txt with: "
+            "SQLAlchemy and psycopg2-binary, then commit and reboot the app. "
+            f"Import error: {SQLALCHEMY_IMPORT_ERROR}"
+        )
+        return None
+
+    try:
+        return create_engine(
+            DATABASE_URL,
+            pool_pre_ping=True,
+            pool_recycle=1800,
+            connect_args={"sslmode": "require", "connect_timeout": 15}
+        )
+    except Exception as e:
+        set_database_error(e)
+        return None
 
 
 def get_connection():
@@ -394,6 +417,8 @@ def get_connection():
 def get_table_columns(table_name):
     if USE_EXTERNAL_DATABASE:
         engine = get_external_engine()
+        if engine is None or inspect is None:
+            return []
         inspector = inspect(engine)
 
         if not inspector.has_table(table_name):
@@ -419,6 +444,9 @@ def create_database():
     try:
         if USE_EXTERNAL_DATABASE:
             engine = get_external_engine()
+            if engine is None:
+                set_database_error("External database engine is not available. Check requirements.txt, DATABASE_URL secret, and Supabase status.")
+                return False
 
             with engine.begin() as conn:
                 conn.execute(sa_text("""
@@ -573,6 +601,9 @@ def save_to_database(df):
         save_df = df[save_cols].copy()
 
         conn = get_connection()
+        if conn is None:
+            set_database_error("Database connection is not available while saving data.")
+            return False
 
         save_df.to_sql(
             "machine_data",
@@ -601,6 +632,9 @@ def load_database():
 
     try:
         conn = get_connection()
+        if conn is None:
+            set_database_error("Database connection is not available while loading data.")
+            return pd.DataFrame()
         df = pd.read_sql_query("SELECT * FROM machine_data", conn)
 
         if not USE_EXTERNAL_DATABASE:
@@ -646,6 +680,9 @@ def clear_database():
     try:
         if USE_EXTERNAL_DATABASE:
             engine = get_external_engine()
+            if engine is None:
+                set_database_error("Database connection is not available while clearing machine data.")
+                return False
             with engine.begin() as conn:
                 conn.execute(sa_text("DELETE FROM machine_data"))
             clear_database_error()
@@ -674,6 +711,9 @@ def save_machine_list(machine_names):
     try:
         if USE_EXTERNAL_DATABASE:
             engine = get_external_engine()
+            if engine is None:
+                set_database_error("Database connection is not available while saving machine list.")
+                return False
 
             with engine.begin() as conn:
                 conn.execute(sa_text("DELETE FROM saved_machines"))
@@ -733,6 +773,9 @@ def load_saved_machine_list():
 
     try:
         conn = get_connection()
+        if conn is None:
+            set_database_error("Database connection is not available while loading saved machine list.")
+            return []
         df = pd.read_sql_query(
             "SELECT machine_name FROM saved_machines ORDER BY machine_name",
             conn
@@ -761,6 +804,9 @@ def clear_saved_machine_list():
     try:
         if USE_EXTERNAL_DATABASE:
             engine = get_external_engine()
+            if engine is None:
+                set_database_error("Database connection is not available while clearing saved machine list.")
+                return False
             with engine.begin() as conn:
                 conn.execute(sa_text("DELETE FROM saved_machines"))
             clear_database_error()
