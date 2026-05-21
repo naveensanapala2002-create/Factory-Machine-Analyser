@@ -878,15 +878,11 @@ def standardize_csv(df, file_name):
     diameter_cols, diameter_selection_logic = select_diameter_columns(df)
     rpm_cols = select_rpm_columns(df)
 
+    # Speed requirement:
+    # Use only the exact "speed" column for speed analysis.
+    # Do not automatically take traction_speed, line_speed, bi_color_speed, etc.
     speed_col = find_best_numeric_column(df, [
-        "speed",
-        "line_speed",
-        "traction_speed",
-        "line speed",
-        "actual_speed",
-        "machine_speed",
-        "line_speed_1",
-        "bi_color_speed"
+        "speed"
     ])
 
     quantity_col = find_best_numeric_column(df, [
