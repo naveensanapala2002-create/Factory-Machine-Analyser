@@ -11,7 +11,7 @@ from pathlib import Path
 from io import BytesIO
 from datetime import datetime, time
 from sqlalchemy import create_engine, text as sa_text, inspect
-from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
+from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode, quote, unquote
 
 # =========================================================
 # APP SETTINGS
@@ -267,6 +267,12 @@ def convert_supabase_direct_url_to_pooler(url):
         username = parsed.username or "postgres"
         password = parsed.password or ""
 
+        # Safely handle URL-encoded passwords.
+        # Example: Naveen!@#143 should be stored in Streamlit Secrets as Naveen%21%40%23143.
+        # When rebuilding the pooler URL, keep username/password safely encoded so @/# do not break the URL.
+        username = quote(unquote(username), safe=".")
+        password = quote(unquote(password), safe="") if password else ""
+
         # Supabase pooler username format is normally postgres.<project-ref>
         if username == "postgres":
             username = f"postgres.{project_ref}"
@@ -335,6 +341,23 @@ DATABASE_URL = normalize_database_url(RAW_DATABASE_URL)
 USE_EXTERNAL_DATABASE = bool(DATABASE_URL)
 
 
+def set_database_error(error):
+    st.session_state["DATABASE_LAST_ERROR"] = str(error)
+
+
+def clear_database_error():
+    st.session_state.pop("DATABASE_LAST_ERROR", None)
+
+
+def show_database_error_if_any():
+    error = st.session_state.get("DATABASE_LAST_ERROR")
+    if error:
+        st.error("Database connection/storage error. The app is still running, but database actions are currently failing.")
+        with st.expander("Show technical database error"):
+            st.code(error)
+        st.info("Check Streamlit Secrets DATABASE_URL, Supabase password, and Supabase project status. After correction, reboot the app.")
+
+
 @st.cache_resource(show_spinner=False)
 def get_external_engine():
     if not DATABASE_URL:
@@ -344,7 +367,7 @@ def get_external_engine():
         DATABASE_URL,
         pool_pre_ping=True,
         pool_recycle=1800,
-        connect_args={"sslmode": "require"}
+        connect_args={"sslmode": "require", "connect_timeout": 15}
     )
 
 
@@ -386,245 +409,292 @@ def get_table_columns(table_name):
 
 
 def create_database():
-    if USE_EXTERNAL_DATABASE:
-        engine = get_external_engine()
+    """Create required tables. This function is safe to call repeatedly.
 
-        with engine.begin() as conn:
-            conn.execute(sa_text("""
-                CREATE TABLE IF NOT EXISTS machine_data (
-                    id SERIAL PRIMARY KEY,
-                    timestamp TEXT,
-                    machine_name TEXT,
-                    machine_key TEXT,
-                    diameter DOUBLE PRECISION,
-                    rpm DOUBLE PRECISION,
-                    line_speed DOUBLE PRECISION,
-                    quantity DOUBLE PRECISION,
-                    diameter_source_column TEXT,
-                    rpm_source_column TEXT,
-                    speed_source_column TEXT,
-                    data_pair TEXT,
-                    source_file TEXT,
-                    uploaded_date TEXT
-                )
-            """))
+    Important Streamlit Cloud fix:
+    Database creation is attempted lazily and errors are captured instead of crashing
+    the whole app at startup.
+    """
+    try:
+        if USE_EXTERNAL_DATABASE:
+            engine = get_external_engine()
 
-            conn.execute(sa_text("""
-                CREATE TABLE IF NOT EXISTS saved_machines (
-                    id SERIAL PRIMARY KEY,
-                    machine_name TEXT UNIQUE,
-                    machine_key TEXT,
-                    saved_date TEXT
-                )
-            """))
+            with engine.begin() as conn:
+                conn.execute(sa_text("""
+                    CREATE TABLE IF NOT EXISTS machine_data (
+                        id SERIAL PRIMARY KEY,
+                        timestamp TEXT,
+                        machine_name TEXT,
+                        machine_key TEXT,
+                        diameter DOUBLE PRECISION,
+                        rpm DOUBLE PRECISION,
+                        line_speed DOUBLE PRECISION,
+                        quantity DOUBLE PRECISION,
+                        diameter_source_column TEXT,
+                        rpm_source_column TEXT,
+                        speed_source_column TEXT,
+                        data_pair TEXT,
+                        source_file TEXT,
+                        uploaded_date TEXT
+                    )
+                """))
 
-            required_machine_data_cols = {
-                "machine_key": "TEXT",
-                "diameter_source_column": "TEXT",
-                "rpm_source_column": "TEXT",
-                "speed_source_column": "TEXT",
-                "data_pair": "TEXT",
-                "line_speed": "DOUBLE PRECISION",
-                "quantity": "DOUBLE PRECISION",
-                "source_file": "TEXT",
-                "uploaded_date": "TEXT"
-            }
+                conn.execute(sa_text("""
+                    CREATE TABLE IF NOT EXISTS saved_machines (
+                        id SERIAL PRIMARY KEY,
+                        machine_name TEXT UNIQUE,
+                        machine_key TEXT,
+                        saved_date TEXT
+                    )
+                """))
 
-            for col, dtype in required_machine_data_cols.items():
-                conn.execute(sa_text(
-                    f"ALTER TABLE machine_data ADD COLUMN IF NOT EXISTS {col} {dtype}"
-                ))
+                required_machine_data_cols = {
+                    "machine_key": "TEXT",
+                    "diameter_source_column": "TEXT",
+                    "rpm_source_column": "TEXT",
+                    "speed_source_column": "TEXT",
+                    "data_pair": "TEXT",
+                    "line_speed": "DOUBLE PRECISION",
+                    "quantity": "DOUBLE PRECISION",
+                    "source_file": "TEXT",
+                    "uploaded_date": "TEXT"
+                }
 
-            required_saved_cols = {
-                "machine_key": "TEXT",
-                "saved_date": "TEXT"
-            }
+                for col, dtype in required_machine_data_cols.items():
+                    conn.execute(sa_text(
+                        f"ALTER TABLE machine_data ADD COLUMN IF NOT EXISTS {col} {dtype}"
+                    ))
 
-            for col, dtype in required_saved_cols.items():
-                conn.execute(sa_text(
-                    f"ALTER TABLE saved_machines ADD COLUMN IF NOT EXISTS {col} {dtype}"
-                ))
+                required_saved_cols = {
+                    "machine_key": "TEXT",
+                    "saved_date": "TEXT"
+                }
 
-        return
+                for col, dtype in required_saved_cols.items():
+                    conn.execute(sa_text(
+                        f"ALTER TABLE saved_machines ADD COLUMN IF NOT EXISTS {col} {dtype}"
+                    ))
 
-    conn = get_connection()
-    cur = conn.cursor()
+            clear_database_error()
+            return True
 
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS machine_data (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp TEXT,
-            machine_name TEXT,
-            machine_key TEXT,
-            diameter REAL,
-            rpm REAL,
-            line_speed REAL,
-            quantity REAL,
-            diameter_source_column TEXT,
-            rpm_source_column TEXT,
-            speed_source_column TEXT,
-            source_file TEXT,
-            uploaded_date TEXT
-        )
-    """)
+        conn = get_connection()
+        cur = conn.cursor()
 
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS saved_machines (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            machine_name TEXT UNIQUE,
-            machine_key TEXT,
-            saved_date TEXT
-        )
-    """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS machine_data (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT,
+                machine_name TEXT,
+                machine_key TEXT,
+                diameter REAL,
+                rpm REAL,
+                line_speed REAL,
+                quantity REAL,
+                diameter_source_column TEXT,
+                rpm_source_column TEXT,
+                speed_source_column TEXT,
+                source_file TEXT,
+                uploaded_date TEXT
+            )
+        """)
 
-    machine_data_cols = get_table_columns("machine_data")
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS saved_machines (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                machine_name TEXT UNIQUE,
+                machine_key TEXT,
+                saved_date TEXT
+            )
+        """)
 
-    required_machine_data_cols = {
-        "machine_key": "TEXT",
-        "diameter_source_column": "TEXT",
-        "rpm_source_column": "TEXT",
-        "speed_source_column": "TEXT",
-        "data_pair": "TEXT"
-    }
+        machine_data_cols = get_table_columns("machine_data")
 
-    for col, dtype in required_machine_data_cols.items():
-        if col not in machine_data_cols:
-            cur.execute(f"ALTER TABLE machine_data ADD COLUMN {col} {dtype}")
+        required_machine_data_cols = {
+            "machine_key": "TEXT",
+            "diameter_source_column": "TEXT",
+            "rpm_source_column": "TEXT",
+            "speed_source_column": "TEXT",
+            "data_pair": "TEXT"
+        }
 
-    saved_cols = get_table_columns("saved_machines")
+        for col, dtype in required_machine_data_cols.items():
+            if col not in machine_data_cols:
+                cur.execute(f"ALTER TABLE machine_data ADD COLUMN {col} {dtype}")
 
-    required_saved_cols = {
-        "machine_key": "TEXT",
-        "saved_date": "TEXT"
-    }
+        saved_cols = get_table_columns("saved_machines")
 
-    for col, dtype in required_saved_cols.items():
-        if col not in saved_cols:
-            cur.execute(f"ALTER TABLE saved_machines ADD COLUMN {col} {dtype}")
+        required_saved_cols = {
+            "machine_key": "TEXT",
+            "saved_date": "TEXT"
+        }
 
-    conn.commit()
-    conn.close()
+        for col, dtype in required_saved_cols.items():
+            if col not in saved_cols:
+                cur.execute(f"ALTER TABLE saved_machines ADD COLUMN {col} {dtype}")
 
+        conn.commit()
+        conn.close()
+        clear_database_error()
+        return True
+
+    except Exception as e:
+        set_database_error(e)
+        return False
 
 def save_to_database(df):
-    create_database()
-
-    save_cols = [
-        "timestamp",
-        "machine_name",
-        "machine_key",
-        "diameter",
-        "rpm",
-        "line_speed",
-        "quantity",
-        "diameter_source_column",
-        "rpm_source_column",
-        "speed_source_column",
-        "data_pair",
-        "source_file",
-        "uploaded_date"
-    ]
-
-    for col in save_cols:
-        if col not in df.columns:
-            df[col] = None
-
-    save_df = df[save_cols].copy()
-
-    conn = get_connection()
-
-    save_df.to_sql(
-        "machine_data",
-        conn,
-        if_exists="append",
-        index=False
-    )
-
-    if not USE_EXTERNAL_DATABASE:
-        conn.close()
-
-
-def load_database():
-    create_database()
-
-    conn = get_connection()
-    df = pd.read_sql_query("SELECT * FROM machine_data", conn)
-
-    if not USE_EXTERNAL_DATABASE:
-        conn.close()
-
-    if df.empty:
-        return df
-
-    if "data_pair" not in df.columns:
-        df["data_pair"] = ""
-
-    df["machine_key"] = df["machine_name"].apply(make_machine_key)
-    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
-    df["diameter"] = pd.to_numeric(df["diameter"], errors="coerce")
-    df["rpm"] = pd.to_numeric(df["rpm"], errors="coerce")
-    df["line_speed"] = pd.to_numeric(df["line_speed"], errors="coerce")
-    df["quantity"] = pd.to_numeric(df["quantity"], errors="coerce")
-
-    # Important correction:
-    # If the database contains old rows imported by earlier versions where bi_color_rpm
-    # was used as RPM, exclude those rows from this dashboard.
-    # Current logic allows only screw_rpm_1, screw_rpm_2, screw_rpm_3 as RPM sources.
-    if "rpm_source_column" in df.columns:
-        df["rpm_source_clean"] = df["rpm_source_column"].apply(clean_column_name)
-        df = df[df["rpm_source_clean"].isin(VALID_SCREW_RPM_COLUMNS)].copy()
-        df = df.drop(columns=["rpm_source_clean"], errors="ignore")
-
-    df = df.dropna(subset=["timestamp", "diameter", "rpm"])
-
-    return df
-
-
-def clear_database():
-    create_database()
-
-    if USE_EXTERNAL_DATABASE:
-        engine = get_external_engine()
-        with engine.begin() as conn:
-            conn.execute(sa_text("DELETE FROM machine_data"))
-        return
-
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM machine_data")
-    conn.commit()
-    conn.close()
-
-
-def save_machine_list(machine_names):
-    create_database()
-
-    if USE_EXTERNAL_DATABASE:
-        engine = get_external_engine()
-
-        with engine.begin() as conn:
-            conn.execute(sa_text("DELETE FROM saved_machines"))
-
-            for machine in machine_names:
-                machine = machine.strip()
-
-                if machine:
-                    conn.execute(sa_text("""
-                        INSERT INTO saved_machines
-                        (machine_name, machine_key, saved_date)
-                        VALUES (:machine_name, :machine_key, :saved_date)
-                        ON CONFLICT (machine_name) DO NOTHING
-                    """), {
-                        "machine_name": machine,
-                        "machine_key": make_machine_key(machine),
-                        "saved_date": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    })
-
-        return
-
-    conn = None
+    if not create_database():
+        st.error("Data was not saved because database connection is not available.")
+        show_database_error_if_any()
+        return False
 
     try:
+        save_cols = [
+            "timestamp",
+            "machine_name",
+            "machine_key",
+            "diameter",
+            "rpm",
+            "line_speed",
+            "quantity",
+            "diameter_source_column",
+            "rpm_source_column",
+            "speed_source_column",
+            "data_pair",
+            "source_file",
+            "uploaded_date"
+        ]
+
+        for col in save_cols:
+            if col not in df.columns:
+                df[col] = None
+
+        save_df = df[save_cols].copy()
+
+        conn = get_connection()
+
+        save_df.to_sql(
+            "machine_data",
+            conn,
+            if_exists="append",
+            index=False,
+            chunksize=5000,
+            method="multi"
+        )
+
+        if not USE_EXTERNAL_DATABASE:
+            conn.close()
+
+        clear_database_error()
+        return True
+
+    except Exception as e:
+        set_database_error(e)
+        st.error("Data import failed while saving to database.")
+        show_database_error_if_any()
+        return False
+
+def load_database():
+    if not create_database():
+        return pd.DataFrame()
+
+    try:
+        conn = get_connection()
+        df = pd.read_sql_query("SELECT * FROM machine_data", conn)
+
+        if not USE_EXTERNAL_DATABASE:
+            conn.close()
+
+        if df.empty:
+            clear_database_error()
+            return df
+
+        if "data_pair" not in df.columns:
+            df["data_pair"] = ""
+
+        df["machine_key"] = df["machine_name"].apply(make_machine_key)
+        df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+        df["diameter"] = pd.to_numeric(df["diameter"], errors="coerce")
+        df["rpm"] = pd.to_numeric(df["rpm"], errors="coerce")
+        df["line_speed"] = pd.to_numeric(df["line_speed"], errors="coerce")
+        df["quantity"] = pd.to_numeric(df["quantity"], errors="coerce")
+
+        # Important correction:
+        # If the database contains old rows imported by earlier versions where bi_color_rpm
+        # was used as RPM, exclude those rows from this dashboard.
+        # Current logic allows only screw_rpm_1, screw_rpm_2, screw_rpm_3 as RPM sources.
+        if "rpm_source_column" in df.columns:
+            df["rpm_source_clean"] = df["rpm_source_column"].apply(clean_column_name)
+            df = df[df["rpm_source_clean"].isin(VALID_SCREW_RPM_COLUMNS)].copy()
+            df = df.drop(columns=["rpm_source_clean"], errors="ignore")
+
+        df = df.dropna(subset=["timestamp", "diameter", "rpm"])
+        clear_database_error()
+        return df
+
+    except Exception as e:
+        set_database_error(e)
+        return pd.DataFrame()
+
+def clear_database():
+    if not create_database():
+        st.error("Could not clear data because database connection is not available.")
+        show_database_error_if_any()
+        return False
+
+    try:
+        if USE_EXTERNAL_DATABASE:
+            engine = get_external_engine()
+            with engine.begin() as conn:
+                conn.execute(sa_text("DELETE FROM machine_data"))
+            clear_database_error()
+            return True
+
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM machine_data")
+        conn.commit()
+        conn.close()
+        clear_database_error()
+        return True
+
+    except Exception as e:
+        set_database_error(e)
+        st.error("Could not clear database.")
+        show_database_error_if_any()
+        return False
+
+def save_machine_list(machine_names):
+    if not create_database():
+        st.error("Machine list was not saved because database connection is not available.")
+        show_database_error_if_any()
+        return False
+
+    try:
+        if USE_EXTERNAL_DATABASE:
+            engine = get_external_engine()
+
+            with engine.begin() as conn:
+                conn.execute(sa_text("DELETE FROM saved_machines"))
+
+                for machine in machine_names:
+                    machine = machine.strip()
+
+                    if machine:
+                        conn.execute(sa_text("""
+                            INSERT INTO saved_machines
+                            (machine_name, machine_key, saved_date)
+                            VALUES (:machine_name, :machine_key, :saved_date)
+                            ON CONFLICT (machine_name) DO NOTHING
+                        """), {
+                            "machine_name": machine,
+                            "machine_key": make_machine_key(machine),
+                            "saved_date": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        })
+
+            clear_database_error()
+            return True
+
         conn = get_connection()
         cur = conn.cursor()
 
@@ -646,66 +716,74 @@ def save_machine_list(machine_names):
                 ))
 
         conn.commit()
+        conn.close()
+        clear_database_error()
+        return True
 
     except Exception as e:
-        if conn:
-            conn.rollback()
-        raise e
-
-    finally:
-        if conn:
-            conn.close()
-
+        set_database_error(e)
+        st.error("Machine list was not saved.")
+        show_database_error_if_any()
+        return False
 
 def load_saved_machine_list():
-    create_database()
-
-    conn = get_connection()
-    df = pd.read_sql_query(
-        "SELECT machine_name FROM saved_machines ORDER BY machine_name",
-        conn
-    )
-
-    if not USE_EXTERNAL_DATABASE:
-        conn.close()
-
-    if df.empty:
+    if not create_database():
         return []
-
-    return df["machine_name"].dropna().tolist()
-
-
-def clear_saved_machine_list():
-    create_database()
-
-    if USE_EXTERNAL_DATABASE:
-        engine = get_external_engine()
-        with engine.begin() as conn:
-            conn.execute(sa_text("DELETE FROM saved_machines"))
-        return
-
-    conn = None
 
     try:
         conn = get_connection()
-        cur = conn.cursor()
+        df = pd.read_sql_query(
+            "SELECT machine_name FROM saved_machines ORDER BY machine_name",
+            conn
+        )
 
-        cur.execute("BEGIN IMMEDIATE")
-        cur.execute("DELETE FROM saved_machines")
-
-        conn.commit()
-
-    except Exception as e:
-        if conn:
-            conn.rollback()
-        raise e
-
-    finally:
-        if conn:
+        if not USE_EXTERNAL_DATABASE:
             conn.close()
 
+        if df.empty:
+            clear_database_error()
+            return []
 
-create_database()
+        clear_database_error()
+        return df["machine_name"].dropna().tolist()
+
+    except Exception as e:
+        set_database_error(e)
+        return []
+
+def clear_saved_machine_list():
+    if not create_database():
+        st.error("Saved machine list was not cleared because database connection is not available.")
+        show_database_error_if_any()
+        return False
+
+    try:
+        if USE_EXTERNAL_DATABASE:
+            engine = get_external_engine()
+            with engine.begin() as conn:
+                conn.execute(sa_text("DELETE FROM saved_machines"))
+            clear_database_error()
+            return True
+
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        cur.execute("DELETE FROM saved_machines")
+        conn.commit()
+        conn.close()
+        clear_database_error()
+        return True
+
+    except Exception as e:
+        set_database_error(e)
+        st.error("Saved machine list was not cleared.")
+        show_database_error_if_any()
+        return False
+
+
+
+# Database is created lazily inside database functions.
+# This prevents the deployed Streamlit app from crashing at startup if the external database is temporarily unavailable.
 
 # =========================================================
 # COLUMN LOGIC
@@ -1444,11 +1522,11 @@ with tab1:
             imported_df, errors, import_log = process_uploaded_files(uploaded_files)
 
             if not imported_df.empty:
-                save_to_database(imported_df)
-                st.success(f"Imported successfully: {len(imported_df)} rows")
+                if save_to_database(imported_df):
+                    st.success(f"Imported successfully: {len(imported_df)} rows")
 
                 st.subheader("Import Log")
-                st.dataframe(pd.DataFrame(import_log), use_container_width=True)
+                st.dataframe(pd.DataFrame(import_log), width="stretch")
 
                 st.subheader("Imported Machine Names")
                 imported_names = sorted(imported_df["machine_name"].dropna().unique())
@@ -1458,20 +1536,21 @@ with tab1:
                         "Imported Machine Name": imported_names,
                         "Machine Key": [make_machine_key(m) for m in imported_names]
                     }),
-                    use_container_width=True
+                    width="stretch"
                 )
 
                 st.subheader("Imported Data Preview")
-                st.dataframe(imported_df.head(100), use_container_width=True)
+                st.dataframe(imported_df.head(100), width="stretch")
 
             else:
                 st.error("No valid data imported. Please check skipped files below.")
 
             if errors:
                 st.warning("Some files were skipped.")
-                st.dataframe(pd.DataFrame(errors), use_container_width=True)
+                st.dataframe(pd.DataFrame(errors), width="stretch")
 
     current_data = load_database()
+    show_database_error_if_any()
 
     if USE_EXTERNAL_DATABASE:
         st.success("Storage Mode: Persistent cloud database connected. Uploaded data will remain after app sleep/reboot.")
@@ -1504,7 +1583,7 @@ with tab2:
                 "Machine Name": saved_machines,
                 "Machine Key": [make_machine_key(m) for m in saved_machines]
             }),
-            use_container_width=True
+            width="stretch"
         )
 
         default_text = "\n".join(saved_machines)
@@ -1529,7 +1608,7 @@ with tab2:
                 "Machine Name": parsed_machines,
                 "Machine Key": [make_machine_key(m) for m in parsed_machines]
             }),
-            use_container_width=True
+            width="stretch"
         )
         st.info(f"Total machines in preview: {len(parsed_machines)}")
     else:
@@ -1559,6 +1638,7 @@ with tab3:
     st.header("Continuous Diameter Zone Analysis")
 
     data = load_database()
+    show_database_error_if_any()
 
     if data.empty:
         st.warning("No data found in database. First upload CSV or ZIP files in Upload Data tab.")
@@ -1726,7 +1806,7 @@ with tab3:
         if saved_machine_list:
             st.subheader("Machine Match Status")
             st.caption("This table updates based on the selected Start Date/Time and End Date/Time range.")
-            st.dataframe(match_table, use_container_width=True)
+            st.dataframe(match_table, width="stretch")
 
             if unmatched_saved_machines:
                 st.warning(
@@ -1788,7 +1868,7 @@ with tab3:
             if len(selected_machines) > 1:
                 visible_cols = ["Machine"] + visible_cols
 
-            st.dataframe(zone_result[visible_cols], use_container_width=True)
+            st.dataframe(zone_result[visible_cols], width="stretch")
 
             st.subheader("RPM Max Ascending Zone Table")
             st.caption(
@@ -1800,7 +1880,7 @@ with tab3:
             if rpm_ascending_result.empty:
                 st.warning("No RPM Max Ascending rows found because Screw RPM Max or Speed values are 0/blank.")
             else:
-                st.dataframe(rpm_ascending_result, use_container_width=True)
+                st.dataframe(rpm_ascending_result, width="stretch")
 
             st.subheader("Same Diameter Comparison Table")
             st.caption(
@@ -1814,7 +1894,7 @@ with tab3:
             elif same_diameter_result.empty:
                 st.warning("No same diameter values found across all selected machines in the selected date/time range.")
             else:
-                st.dataframe(same_diameter_result, use_container_width=True)
+                st.dataframe(same_diameter_result, width="stretch")
 
             st.subheader("Graph 1: Zone Duration by Diameter")
 
@@ -1836,7 +1916,7 @@ with tab3:
                 ],
                 title="Continuous Zone Duration"
             )
-            st.plotly_chart(fig_duration, use_container_width=True)
+            st.plotly_chart(fig_duration, width="stretch")
 
             st.subheader("Graph 2: Screw RPM Max Ascending by Zone")
 
@@ -1859,7 +1939,7 @@ with tab3:
                     ],
                     title="Screw RPM Max - Ascending Zone View"
                 )
-                st.plotly_chart(fig_rpm_max, use_container_width=True)
+                st.plotly_chart(fig_rpm_max, width="stretch")
 
         st.subheader("Graph 3: Diameter Trend for Selected Machine(s)")
 
@@ -1870,7 +1950,7 @@ with tab3:
             color="machine_name" if len(selected_machines) > 1 else "data_pair",
             title="Integer Diameter vs Time"
         )
-        st.plotly_chart(fig_dia, use_container_width=True)
+        st.plotly_chart(fig_dia, width="stretch")
 
         st.subheader("Graph 4: Screw RPM Trend for Selected Machine(s)")
 
@@ -1881,10 +1961,10 @@ with tab3:
             color="machine_name" if len(selected_machines) > 1 else "data_pair",
             title="Integer Screw RPM vs Time"
         )
-        st.plotly_chart(fig_rpm, use_container_width=True)
+        st.plotly_chart(fig_rpm, width="stretch")
 
         st.subheader("Selected Machine Raw Data")
-        st.dataframe(selected_data, use_container_width=True)
+        st.dataframe(selected_data, width="stretch")
 
         excel_data = convert_to_excel(
             zone_result,
@@ -1912,6 +1992,7 @@ with tab4:
 
     db_data = load_database()
     saved_machines = load_saved_machine_list()
+    show_database_error_if_any()
 
     st.write("Database storage mode:")
 
@@ -1940,7 +2021,7 @@ with tab4:
                 "Machine Name": saved_machines,
                 "Machine Key": [make_machine_key(m) for m in saved_machines]
             }),
-            use_container_width=True
+            width="stretch"
         )
 
     if not db_data.empty:
@@ -1953,7 +2034,7 @@ with tab4:
                 "Imported Machine Name": imported_names,
                 "Machine Key": [make_machine_key(m) for m in imported_names]
             }),
-            use_container_width=True
+            width="stretch"
         )
 
         st.subheader("Source Columns Used")
@@ -1971,10 +2052,10 @@ with tab4:
         existing_cols = [col for col in available_cols if col in db_data.columns]
         source_cols = db_data[existing_cols].drop_duplicates()
 
-        st.dataframe(source_cols, use_container_width=True)
+        st.dataframe(source_cols, width="stretch")
 
         st.subheader("Stored Data Preview")
-        st.dataframe(db_data.tail(100), use_container_width=True)
+        st.dataframe(db_data.tail(100), width="stretch")
 
     st.warning("Use Clear Database only if you want to delete all imported machine data.")
 
