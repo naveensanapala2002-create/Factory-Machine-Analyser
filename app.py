@@ -1135,15 +1135,59 @@ def read_csv_from_file_object(file_obj, file_name):
     return standardize_csv(df, file_name)
 
 
-def process_uploaded_files(uploaded_files):
+def process_uploaded_files(uploaded_files, allowed_machine_names=None):
+    """
+    Imports only files that match the Current Frozen Machine List.
+
+    Requirement:
+    - When CSV/ZIP is uploaded, process only CSV files whose extracted machine name
+      matches one of the saved/frozen machines.
+    - Skip all other machines before reading/importing, so unwanted machine data
+      does not occupy database storage.
+    """
     imported_data = []
     error_list = []
     import_log = []
+
+    allowed_machine_names = allowed_machine_names or []
+    allowed_machine_names = [str(m).strip() for m in allowed_machine_names if str(m).strip()]
+
+    if not allowed_machine_names:
+        error_list.append({
+            "file": "All uploaded files",
+            "issue": "No Current Frozen Machine List found. Please save/freeze machine names first in Machine List Setup.",
+            "columns_found": ""
+        })
+        return pd.DataFrame(), error_list, import_log
+
+    def is_allowed_machine_file(candidate_file_name):
+        imported_machine_name = extract_machine_name(candidate_file_name)
+
+        for saved_machine in allowed_machine_names:
+            if is_machine_match(saved_machine, imported_machine_name):
+                return True
+
+        return False
+
+    def add_skipped_log(candidate_file_name):
+        imported_machine_name = extract_machine_name(candidate_file_name)
+
+        import_log.append({
+            "file": candidate_file_name,
+            "machine_name": imported_machine_name,
+            "machine_key": make_machine_key(imported_machine_name),
+            "status": "Skipped - Not in Current Frozen Machine List",
+            "rows": 0
+        })
 
     for uploaded_file in uploaded_files:
         file_name = uploaded_file.name
 
         if file_name.lower().endswith(".csv"):
+            if not is_allowed_machine_file(file_name):
+                add_skipped_log(file_name)
+                continue
+
             result_df, missing, columns, info = read_csv_from_file_object(uploaded_file, file_name)
 
             if result_df is not None and not result_df.empty:
@@ -1171,9 +1215,13 @@ def process_uploaded_files(uploaded_files):
                 with zipfile.ZipFile(zip_bytes, "r") as zip_ref:
                     for inner_file in zip_ref.namelist():
                         if inner_file.lower().endswith(".csv"):
-                            with zip_ref.open(inner_file) as csv_file:
-                                csv_name = Path(inner_file).name
+                            csv_name = Path(inner_file).name
 
+                            if not is_allowed_machine_file(csv_name):
+                                add_skipped_log(csv_name)
+                                continue
+
+                            with zip_ref.open(inner_file) as csv_file:
                                 result_df, missing, columns, info = read_csv_from_file_object(csv_file, csv_name)
 
                                 if result_df is not None and not result_df.empty:
@@ -1207,7 +1255,6 @@ def process_uploaded_files(uploaded_files):
         final_df = pd.DataFrame()
 
     return final_df, error_list, import_log
-
 
 # =========================================================
 # MACHINE LIST PARSING
@@ -1558,6 +1605,7 @@ def main():
         - Screw RPM: **screw_rpm_1, screw_rpm_2, screw_rpm_3** in order
         - **bi_color_rpm is not used as Screw RPM**
         - Decimal values are converted into single integer values, example: **2.28800010681152 → 2**
+        - Import filter: only files matching **Current Frozen Machine List** are imported; remaining machines are skipped to save storage.
         """)
 
         uploaded_files = st.file_uploader(
@@ -1568,7 +1616,11 @@ def main():
 
         if uploaded_files:
             if st.button("Import Uploaded Files to Database"):
-                imported_df, errors, import_log = process_uploaded_files(uploaded_files)
+                saved_machine_filter = load_saved_machine_list()
+                imported_df, errors, import_log = process_uploaded_files(
+                    uploaded_files,
+                    allowed_machine_names=saved_machine_filter
+                )
 
                 if not imported_df.empty:
                     if save_to_database(imported_df):
