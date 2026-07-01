@@ -605,13 +605,27 @@ def save_to_database(df):
             set_database_error("Database connection is not available while saving data.")
             return False
 
+        # Permanent fix for error: "too many SQL variables".
+        # SQLite has a limit on how many values can be inserted in one SQL statement.
+        # Earlier chunksize=5000 with method="multi" can create too many placeholders
+        # when many CSV/ZIP rows are imported at once.
+        #
+        # Local PC / SQLite: use pandas default executemany with small chunks.
+        # Supabase/PostgreSQL: use safe multi insert chunks.
+        if USE_EXTERNAL_DATABASE:
+            safe_chunksize = 500
+            safe_method = "multi"
+        else:
+            safe_chunksize = 200
+            safe_method = None
+
         save_df.to_sql(
             "machine_data",
             conn,
             if_exists="append",
             index=False,
-            chunksize=5000,
-            method="multi"
+            chunksize=safe_chunksize,
+            method=safe_method
         )
 
         if not USE_EXTERNAL_DATABASE:
@@ -1295,15 +1309,40 @@ def format_duration(minutes):
     return f"{minutes_left}m {seconds_left}s"
 
 
+def get_most_repeated_positive_value(series):
+    """Return the most repeated numeric value from values greater than 0."""
+    numeric = pd.to_numeric(series, errors="coerce")
+    numeric = numeric[numeric > 0].dropna()
+
+    if numeric.empty:
+        return None
+
+    counts = numeric.value_counts(dropna=True)
+    max_count = counts.max()
+    candidates = counts[counts == max_count].index.tolist()
+
+    # When two values have the same frequency, choose the lower value for stable output.
+    return sorted(candidates)[0]
+
+
 def create_continuous_diameter_zone_analysis(df, machine_name, min_duration_minutes=30):
     """
-    Logic:
-    1. Data is converted to single integer diameter value.
-    2. A zone is a continuous run where the diameter value remains the same.
-    3. If diameter changes, a new zone starts.
-    4. Zones with duration <= 30 minutes are ignored.
-    5. For each valid zone, RPM min/max, positive speed at max RPM, timestamps, and duration are calculated.
-    6. Speed values are considered only when they are greater than 0.
+    Final logic for dashboard zone tables, applied to every selected machine:
+
+    1. Diameter decimal readings are converted to integer values.
+       Example: 1.870 -> 1.
+    2. Only rows where Diameter > 0, Screw RPM > 0 and Speed > 0 are considered.
+    3. A primary zone starts when the integer Diameter changes.
+    4. Inside each same-diameter primary zone, split again whenever Speed or Screw RPM changes.
+    5. Every continuous Diameter + Speed + RPM segment with duration > 30 minutes is shown.
+
+    This means every selected machine follows the same logic.
+    The dashboard will not keep only one most-repeated speed.
+    It will show all valid highlighted rows such as:
+    Diameter 1 | Speed 40   | RPM 8 | duration > 30 minutes
+    Diameter 1 | Speed 45   | RPM 9 | duration > 30 minutes
+    Diameter 1 | Speed 50   | RPM 9 | duration > 30 minutes
+    Diameter 1 | Speed 33.9 | RPM 6 | duration > 30 minutes
     """
     if df.empty:
         return pd.DataFrame()
@@ -1315,70 +1354,93 @@ def create_continuous_diameter_zone_analysis(df, machine_name, min_duration_minu
     work["rpm"] = convert_decimal_to_single_value(work["rpm"])
     work["line_speed"] = pd.to_numeric(work.get("line_speed", 0), errors="coerce")
 
-    work = work.dropna(subset=["diameter", "rpm"])
+    # Requirement: Diameter, Screw RPM and Speed must be greater than 0 for all output tables.
+    work = work.dropna(subset=["diameter", "rpm", "line_speed"])
+    work = work[
+        (pd.to_numeric(work["diameter"], errors="coerce") > 0) &
+        (pd.to_numeric(work["rpm"], errors="coerce") > 0) &
+        (pd.to_numeric(work["line_speed"], errors="coerce") > 0)
+    ].copy()
+
+    if work.empty:
+        return pd.DataFrame()
+
+    # Stable numeric values for segmenting and display.
+    work["diameter"] = pd.to_numeric(work["diameter"], errors="coerce").astype("Int64")
+    work["rpm"] = pd.to_numeric(work["rpm"], errors="coerce").astype("Int64")
+    work["line_speed"] = pd.to_numeric(work["line_speed"], errors="coerce").round(3)
 
     all_results = []
 
     for data_pair, pair_df in work.groupby("data_pair", dropna=False):
         pair_df = pair_df.sort_values("timestamp").copy()
 
-        # New zone starts when diameter value changes
-        pair_df["zone_id"] = (pair_df["diameter"] != pair_df["diameter"].shift()).cumsum()
+        # Primary zone starts when diameter changes.
+        pair_df["diameter_zone_id"] = (pair_df["diameter"] != pair_df["diameter"].shift()).cumsum()
 
-        for zone_id, zone_df in pair_df.groupby("zone_id"):
+        for diameter_zone_id, zone_df in pair_df.groupby("diameter_zone_id"):
             zone_df = zone_df.sort_values("timestamp").copy()
-            reading_count = len(zone_df)
-
-            start_time = zone_df["timestamp"].min()
-            end_time = zone_df["timestamp"].max()
-            duration_minutes = (end_time - start_time).total_seconds() / 60
-
-            # User condition: zone duration should be more than 30 minutes
-            if duration_minutes <= min_duration_minutes:
+            if zone_df.empty:
                 continue
 
-            rpm_min = zone_df["rpm"].min()
-            rpm_max = zone_df["rpm"].max()
+            # Inside the same diameter zone, every continuous Speed + RPM combination is separate.
+            segment_change = (
+                (zone_df["line_speed"] != zone_df["line_speed"].shift()) |
+                (zone_df["rpm"] != zone_df["rpm"].shift())
+            )
+            zone_df["speed_rpm_segment_id"] = segment_change.cumsum()
 
-            rpm_min_row = zone_df.loc[zone_df["rpm"].idxmin()]
-            rpm_max_rows = zone_df[zone_df["rpm"] == rpm_max].copy()
+            for segment_id, segment_df in zone_df.groupby("speed_rpm_segment_id"):
+                segment_df = segment_df.sort_values("timestamp").copy()
 
-            # Speed rule: consider speed only when line_speed > 0.
-            # First preference: positive speed at the timestamp(s) where Screw RPM Max occurred.
-            # If that timestamp speed is 0/blank, keep Speed at RPM Max as blank instead of showing 0.
-            rpm_max_positive_speed_rows = rpm_max_rows[
-                pd.to_numeric(rpm_max_rows["line_speed"], errors="coerce") > 0
-            ].copy()
+                if segment_df.empty:
+                    continue
 
-            if not rpm_max_positive_speed_rows.empty:
-                rpm_max_row = rpm_max_positive_speed_rows.sort_values("timestamp").iloc[0]
-                speed_at_rpm_max = rpm_max_row.get("line_speed", None)
-            else:
-                rpm_max_row = rpm_max_rows.sort_values("timestamp").iloc[0]
-                speed_at_rpm_max = None
+                segment_start_time = segment_df["timestamp"].min()
+                segment_end_time = segment_df["timestamp"].max()
+                segment_duration_minutes = (segment_end_time - segment_start_time).total_seconds() / 60
 
-            diameter_value = int(zone_df["diameter"].iloc[0])
+                # User condition: every selected Diameter + Speed + RPM segment should be more than 30 minutes.
+                if segment_duration_minutes <= min_duration_minutes:
+                    continue
 
-            all_results.append({
-                "Machine": machine_name,
-                "Data Pair": data_pair,
-                "Zone No": len(all_results) + 1,
-                "Diameter": diameter_value,
-                "Screw RPM Min": int(rpm_min) if pd.notna(rpm_min) else None,
-                "Screw RPM Max": int(rpm_max) if pd.notna(rpm_max) else None,
-                "Speed at RPM Max": round(float(speed_at_rpm_max), 3) if pd.notna(speed_at_rpm_max) else None,
-                "Start Timestamp": start_time,
-                "End Timestamp": end_time,
-                "Duration Minutes": round(duration_minutes, 2),
-                "Duration": format_duration(duration_minutes),
-                "Readings Count": reading_count,
-                "RPM Min Timestamp": rpm_min_row["timestamp"],
-                "RPM Max Timestamp": rpm_max_row["timestamp"],
-                "Diameter Source": zone_df["diameter_source_column"].iloc[0],
-                "RPM Source": zone_df["rpm_source_column"].iloc[0],
-                "Speed Source": zone_df["speed_source_column"].iloc[0] if "speed_source_column" in zone_df.columns else None,
-                "Source File": zone_df["source_file"].iloc[0]
-            })
+                segment_reading_count = len(segment_df)
+                diameter_value = int(segment_df["diameter"].iloc[0])
+                segment_speed = float(segment_df["line_speed"].iloc[0])
+                segment_rpm = int(segment_df["rpm"].iloc[0])
+
+                # Since segment is split by Speed + RPM, min/max are normally same.
+                rpm_min = segment_df["rpm"].min()
+                rpm_max = segment_df["rpm"].max()
+                rpm_min_row = segment_df.loc[segment_df["rpm"].idxmin()]
+                rpm_max_row = segment_df.loc[segment_df["rpm"].idxmax()]
+                first_segment_row = segment_df.sort_values("timestamp").iloc[0]
+
+                all_results.append({
+                    "Machine": machine_name,
+                    "Data Pair": data_pair,
+                    "Zone No": len(all_results) + 1,
+                    "Diameter": diameter_value,
+                    "Screw RPM Min": int(rpm_min) if pd.notna(rpm_min) else None,
+                    "Screw RPM Max": int(rpm_max) if pd.notna(rpm_max) else None,
+                    # Compatibility columns kept, but now they represent every valid segment.
+                    "Most Repeated Speed": round(segment_speed, 3),
+                    "RPM at Most Repeated Speed": segment_rpm,
+                    "Speed at RPM Max": round(segment_speed, 3),
+                    # These timestamps and duration are for this exact Diameter + Speed + RPM segment.
+                    "Start Timestamp": segment_start_time,
+                    "End Timestamp": segment_end_time,
+                    "Duration Minutes": round(segment_duration_minutes, 2),
+                    "Duration": format_duration(segment_duration_minutes),
+                    "Readings Count": segment_reading_count,
+                    "RPM Min Timestamp": rpm_min_row["timestamp"],
+                    "RPM Max Timestamp": rpm_max_row["timestamp"],
+                    "Most Repeated RPM Timestamp": first_segment_row["timestamp"],
+                    "Diameter Source": segment_df["diameter_source_column"].iloc[0],
+                    "RPM Source": segment_df["rpm_source_column"].iloc[0],
+                    "Speed Source": segment_df["speed_source_column"].iloc[0] if "speed_source_column" in segment_df.columns else None,
+                    "Source File": segment_df["source_file"].iloc[0]
+                })
 
     result = pd.DataFrame(all_results)
 
@@ -1390,7 +1452,6 @@ def create_continuous_diameter_zone_analysis(df, machine_name, min_duration_minu
         result["Zone No"] = result.groupby("Machine").cumcount() + 1
 
     return result
-
 
 def create_rpm_max_ascending_zone_table(zone_result):
     """
@@ -1404,6 +1465,11 @@ def create_rpm_max_ascending_zone_table(zone_result):
         return pd.DataFrame()
 
     result = zone_result.copy()
+
+    # Requirement: Diameter and Screw RPM must be greater than 0.
+    if "Diameter" in result.columns:
+        result["Diameter"] = pd.to_numeric(result["Diameter"], errors="coerce")
+        result = result[result["Diameter"] > 0].copy()
 
     # Requirement: while taking Screw RPM, consider only values greater than 0.
     # This prevents zero RPM zones from appearing in the RPM Max Ascending Zone Table.
@@ -1433,6 +1499,8 @@ def create_rpm_max_ascending_zone_table(zone_result):
         "Diameter",
         "Screw RPM Max",
         "Speed",
+        "Most Repeated Speed",
+        "RPM at Most Repeated Speed",
         "Start Timestamp",
         "End Timestamp",
         "Duration",
@@ -1466,8 +1534,9 @@ def create_same_diameter_selected_machines_table(zone_result, selected_machines)
     Requirement:
     - Compare all machines selected in Zone Analysis Dropdown.
     - Find diameter values that are common across all selected machines.
-    - For those common diameter values, show each machine's zone details:
-      diameter, screw RPM, speed, start time, end time, and duration.
+    - For common diameters, show ALL valid continuous Speed + RPM segments from every selected machine.
+    - Diameter, Speed and Screw RPM must all be greater than 0.
+    - Each exact Diameter + Speed + RPM segment must have duration greater than 30 minutes.
     - Existing tables are not disturbed.
     """
     if zone_result.empty or not selected_machines or len(selected_machines) < 2:
@@ -1475,20 +1544,24 @@ def create_same_diameter_selected_machines_table(zone_result, selected_machines)
 
     work = zone_result.copy()
 
-    required_base_cols = ["Machine", "Diameter", "Screw RPM Max", "Speed at RPM Max"]
-    for col in required_base_cols:
-        if col not in work.columns:
-            return pd.DataFrame()
+    if "Machine" not in work.columns or "Diameter" not in work.columns:
+        return pd.DataFrame()
+
+    rpm_col = "RPM at Most Repeated Speed" if "RPM at Most Repeated Speed" in work.columns else "Screw RPM Max"
+    speed_col = "Most Repeated Speed" if "Most Repeated Speed" in work.columns else "Speed at RPM Max"
+
+    if rpm_col not in work.columns or speed_col not in work.columns:
+        return pd.DataFrame()
 
     work["Diameter"] = pd.to_numeric(work["Diameter"], errors="coerce")
-    work["Screw RPM Max"] = pd.to_numeric(work["Screw RPM Max"], errors="coerce")
-    work["Speed at RPM Max"] = pd.to_numeric(work["Speed at RPM Max"], errors="coerce")
+    work[rpm_col] = pd.to_numeric(work[rpm_col], errors="coerce")
+    work[speed_col] = pd.to_numeric(work[speed_col], errors="coerce")
 
-    # Keep only meaningful RPM and speed rows.
+    # Diameter, RPM and Speed must all be greater than 0 for comparison.
     work = work[
-        (work["Diameter"].notna()) &
-        (work["Screw RPM Max"] > 0) &
-        (work["Speed at RPM Max"] > 0)
+        (work["Diameter"] > 0) &
+        (work[rpm_col] > 0) &
+        (work[speed_col] > 0)
     ].copy()
 
     if work.empty:
@@ -1512,15 +1585,16 @@ def create_same_diameter_selected_machines_table(zone_result, selected_machines)
 
     result = work[work["Diameter"].isin(common_diameters)].copy()
 
-    result = result.rename(columns={
-        "Machine": "Selected Machine",
-        "Diameter": "Same Diameter in Selected Machines",
-        "Screw RPM Max": "Screw RPM",
-        "Speed at RPM Max": "Speed",
-        "Start Timestamp": "Start Time",
-        "End Timestamp": "End Time",
-        "Duration Minutes": "Duration in Minutes"
-    })
+    # Output uses the priority requested by the user:
+    # Speed = most repeated Speed in that same diameter zone.
+    # Screw RPM = RPM linked to that most repeated Speed.
+    result["Selected Machine"] = result["Machine"]
+    result["Same Diameter in Selected Machines"] = result["Diameter"]
+    result["Screw RPM"] = result[rpm_col]
+    result["Speed"] = result[speed_col]
+    result["Start Time"] = result.get("Start Timestamp")
+    result["End Time"] = result.get("End Timestamp")
+    result["Duration in Minutes"] = result.get("Duration Minutes")
 
     output_cols = [
         "Selected Machine",
@@ -1532,6 +1606,7 @@ def create_same_diameter_selected_machines_table(zone_result, selected_machines)
         "Duration",
         "Duration in Minutes",
         "Data Pair",
+        "Most Repeated RPM Timestamp",
         "RPM Max Timestamp",
         "Diameter Source",
         "RPM Source",
@@ -1545,8 +1620,8 @@ def create_same_diameter_selected_machines_table(zone_result, selected_machines)
     result = result[output_cols].copy()
 
     result = result.sort_values(
-        by=["Same Diameter in Selected Machines", "Selected Machine", "Screw RPM", "Start Time"],
-        ascending=[True, True, True, True]
+        by=["Same Diameter in Selected Machines", "Selected Machine", "Speed", "Screw RPM", "Start Time"],
+        ascending=[True, True, True, True, True]
     ).reset_index(drop=True)
 
     result.insert(0, "Sl.No", range(1, len(result) + 1))
@@ -1941,7 +2016,10 @@ def main():
             - Same continuous diameter value is treated as one zone.
             - When diameter changes, a new zone starts.
             - Only zones with **more than 30 minutes** are considered.
-            - For each zone, RPM minimum, RPM maximum, speed greater than 0, start timestamp, end timestamp, and duration are calculated.
+            - For each zone, Diameter, RPM and Speed values greater than 0 only are considered.
+            - Inside each same-diameter zone, the data is split by Speed + Screw RPM.
+            - Every continuous Diameter + Speed + RPM segment greater than 30 minutes is shown.
+            - Start time, end time and duration are calculated only for each exact Speed/RPM continuous segment, not the full diameter zone.
             - Date/time filtering uses the actual timestamp column from the uploaded CSV/ZIP data.
             """)
 
@@ -1953,6 +2031,8 @@ def main():
                     "Diameter",
                     "Screw RPM Min",
                     "Screw RPM Max",
+                    "Most Repeated Speed",
+                    "RPM at Most Repeated Speed",
                     "Speed at RPM Max",
                     "Start Timestamp",
                     "End Timestamp",
@@ -1974,8 +2054,8 @@ def main():
                 st.subheader("RPM Max Ascending Zone Table")
                 st.caption(
                     "This table is sorted by Machine and Screw RPM Max in ascending order. "
-                    "Only Screw RPM values greater than 0 are considered. "
-                    "Speed shown is the line speed greater than 0 at the same timestamp where Screw RPM Max occurred."
+                    "Only Diameter, Screw RPM and Speed values greater than 0 are considered. "
+                    "All valid Speed + RPM segments are shown using the same logic for every selected machine."
                 )
 
                 if rpm_ascending_result.empty:
@@ -1986,8 +2066,8 @@ def main():
                 st.subheader("Same Diameter Comparison Table")
                 st.caption(
                     "This table compares all machines selected in the Zone Analysis Dropdown. "
-                    "Only diameter values available in all selected machines are shown. "
-                    "RPM and speed values greater than 0 are considered."
+                    "Only same diameter values available in all selected machines are shown. "
+                    "All valid Speed + RPM segments greater than 0 are shown for each common diameter."
                 )
 
                 if len(selected_machines) < 2:
